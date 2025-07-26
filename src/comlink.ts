@@ -193,14 +193,14 @@ export interface TransferHandler<T, S> {
    * value that can be sent in a message, consisting of structured-cloneable
    * values and/or transferrable objects.
    */
-  serialize(value: T): [S, Transferable[]];
+  serialize(value: T): MaybePromise<[S, Transferable[]]>;
 
   /**
    * Gets called to deserialize an incoming value that was serialized in the
    * other thread with this transfer handler (known through the name it was
    * registered under).
    */
-  deserialize(value: S): T;
+  deserialize(value: S): MaybePromise<T>;
 }
 
 /**
@@ -303,7 +303,7 @@ export function expose(
   ep: Endpoint = globalThis as any,
   allowedOrigins: (string | RegExp)[] = ["*"]
 ) {
-  ep.addEventListener("message", function callback(ev: MessageEvent) {
+  ep.addEventListener("message", async function callback(ev: MessageEvent) {
     if (!ev || !ev.data) {
       return;
     }
@@ -315,7 +315,9 @@ export function expose(
       path: [] as string[],
       ...(ev.data as Message),
     };
-    const argumentList = (ev.data.argumentList || []).map(fromWireValue);
+    const argumentList = await Promise.all(
+      (ev.data.argumentList || []).map(fromWireValue)
+    );
     let returnValue;
     try {
       const parent = path.slice(0, -1).reduce((obj, prop) => obj[prop], obj);
@@ -328,7 +330,7 @@ export function expose(
           break;
         case MessageType.SET:
           {
-            parent[path.slice(-1)[0]] = fromWireValue(ev.data.value);
+            parent[path.slice(-1)[0]] = await fromWireValue(ev.data.value);
             returnValue = true;
           }
           break;
@@ -365,8 +367,8 @@ export function expose(
       .catch((value) => {
         return { value, [throwMarker]: 0 };
       })
-      .then((returnValue) => {
-        const [wireValue, transferables] = toWireValue(returnValue);
+      .then(async (returnValue) => {
+        const [wireValue, transferables] = await toWireValue(returnValue);
         ep.postMessage({ ...wireValue, id }, transferables);
         if (type === MessageType.RELEASE) {
           // detach and deactive after sending release response above.
@@ -377,9 +379,9 @@ export function expose(
           }
         }
       })
-      .catch((error) => {
+      .catch(async (error) => {
         // Send Serialization Error To Caller
-        const [wireValue, transferables] = toWireValue({
+        const [wireValue, transferables] = await toWireValue({
           value: new TypeError("Unserializable return value"),
           [throwMarker]: 0,
         });
@@ -400,7 +402,7 @@ function closeEndPoint(endpoint: Endpoint) {
 }
 
 export function wrap<T>(ep: Endpoint, target?: any): Remote<T> {
-  const pendingListeners : PendingListenersMap = new Map();
+  const pendingListeners: PendingListenersMap = new Map();
 
   ep.addEventListener("message", function handleMessage(ev: Event) {
     const { data } = ev as MessageEvent;
@@ -513,16 +515,20 @@ function createProxy<T>(
       throwIfProxyReleased(isProxyReleased);
       // FIXME: ES6 Proxy Handler `set` methods are supposed to return a
       // boolean. To show good will, we return true asynchronously ¯\_(ツ)_/¯
-      const [value, transferables] = toWireValue(rawValue);
-      return requestResponseMessage(
-        epWithPendingListeners,
-        {
-          type: MessageType.SET,
-          path: [...path, prop].map((p) => p.toString()),
-          value,
-        },
-        transferables
-      ).then(fromWireValue) as any;
+      return new Promise(async (resolve) => {
+        const [value, transferables] = await toWireValue(rawValue);
+        resolve(
+          requestResponseMessage(
+            epWithPendingListeners,
+            {
+              type: MessageType.SET,
+              path: [...path, prop].map((p) => p.toString()),
+              value,
+            },
+            transferables
+          ).then(fromWireValue)
+        );
+      }) as any;
     },
     apply(_target, _thisArg, rawArgumentList) {
       throwIfProxyReleased(isProxyReleased);
@@ -536,29 +542,41 @@ function createProxy<T>(
       if (last === "bind") {
         return createProxy(epWithPendingListeners, path.slice(0, -1));
       }
-      const [argumentList, transferables] = processArguments(rawArgumentList);
-      return requestResponseMessage(
-        epWithPendingListeners,
-        {
-          type: MessageType.APPLY,
-          path: path.map((p) => p.toString()),
-          argumentList,
-        },
-        transferables
-      ).then(fromWireValue);
+      return new Promise(async (resolve) => {
+        const [argumentList, transferables] = await processArguments(
+          rawArgumentList
+        );
+        resolve(
+          requestResponseMessage(
+            epWithPendingListeners,
+            {
+              type: MessageType.APPLY,
+              path: path.map((p) => p.toString()),
+              argumentList,
+            },
+            transferables
+          ).then(fromWireValue)
+        );
+      });
     },
     construct(_target, rawArgumentList) {
       throwIfProxyReleased(isProxyReleased);
-      const [argumentList, transferables] = processArguments(rawArgumentList);
-      return requestResponseMessage(
-        epWithPendingListeners,
-        {
-          type: MessageType.CONSTRUCT,
-          path: path.map((p) => p.toString()),
-          argumentList,
-        },
-        transferables
-      ).then(fromWireValue);
+      return new Promise(async (resolve) => {
+        const [argumentList, transferables] = await processArguments(
+          rawArgumentList
+        );
+        resolve(
+          requestResponseMessage(
+            epWithPendingListeners,
+            {
+              type: MessageType.CONSTRUCT,
+              path: path.map((p) => p.toString()),
+              argumentList,
+            },
+            transferables
+          ).then(fromWireValue)
+        );
+      });
     },
   });
   registerProxy(proxy, epWithPendingListeners);
@@ -569,8 +587,10 @@ function myFlat<T>(arr: (T | T[])[]): T[] {
   return Array.prototype.concat.apply([], arr);
 }
 
-function processArguments(argumentList: any[]): [WireValue[], Transferable[]] {
-  const processed = argumentList.map(toWireValue);
+async function processArguments(
+  argumentList: any[]
+): Promise<[WireValue[], Transferable[]]> {
+  const processed = await Promise.all(argumentList.map(toWireValue));
   return [processed.map((v) => v[0]), myFlat(processed.map((v) => v[1]))];
 }
 
@@ -597,10 +617,10 @@ export function windowEndpoint(
   };
 }
 
-function toWireValue(value: any): [WireValue, Transferable[]] {
+async function toWireValue(value: any): Promise<[WireValue, Transferable[]]> {
   for (const [name, handler] of transferHandlers) {
     if (handler.canHandle(value)) {
-      const [serializedValue, transferables] = handler.serialize(value);
+      const [serializedValue, transferables] = await handler.serialize(value);
       return [
         {
           type: WireValueType.HANDLER,
@@ -620,10 +640,10 @@ function toWireValue(value: any): [WireValue, Transferable[]] {
   ];
 }
 
-function fromWireValue(value: WireValue): any {
+async function fromWireValue(value: WireValue): Promise<any> {
   switch (value.type) {
     case WireValueType.HANDLER:
-      return transferHandlers.get(value.name)!.deserialize(value.value);
+      return await transferHandlers.get(value.name)!.deserialize(value.value);
     case WireValueType.RAW:
       return value.value;
   }
@@ -643,7 +663,7 @@ function requestResponseMessage(
       ep.start();
     }
     ep.postMessage({ id, ...msg }, transfers);
-});
+  });
 }
 
 function generateUUID(): string {

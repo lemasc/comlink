@@ -12,6 +12,7 @@
  */
 
 import * as Comlink from "/base/dist/esm/comlink.mjs";
+import "/base/tests/fixtures/transfer-handlers.js";
 
 describe("Comlink across workers", function () {
   beforeEach(function () {
@@ -44,5 +45,31 @@ describe("Comlink across workers", function () {
       otherEp.close = resolve; // Resolve the promise when the MessagePort is closed.
       otherProxy[Comlink.releaseProxy](); // Release the proxy, which should close the MessagePort.
     });
+  });
+});
+
+describe("Comlink with transfer handlers", function () {
+  beforeEach(function () {
+    this.worker = new Worker(
+      "/base/tests/fixtures/worker-transfer-handlers.js"
+    );
+    registerMockTransferHandlers(Comlink);
+  });
+
+  afterEach(function () {
+    this.worker.terminate();
+    unregisterMockTransferHandlers(Comlink);
+  });
+
+  it("can communicate with a sync transfer handler", async function () {
+    const proxy = Comlink.wrap(this.worker);
+    const buffer = new ArrayBuffer(8);
+    expect(await proxy.sendArrayBuffer(buffer)).to.be.true;
+  });
+
+  it("can communicate with a async transfer handler", async function () {
+    const proxy = Comlink.wrap(this.worker);
+    const file = new File(["test"], "hello.txt", { type: "text/plain" });
+    expect(await proxy.sendFile(file)).to.be.true;
   });
 });
